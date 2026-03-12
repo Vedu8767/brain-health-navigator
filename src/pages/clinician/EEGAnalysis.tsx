@@ -301,11 +301,11 @@ export default function EEGAnalysis() {
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-muted-foreground">Avg Alpha Power</span>
-                    <span className="font-display font-bold">{csvStats.alphaAvg}</span>
+                    <span className="font-display font-bold">{csvStats.alphaAvg.toFixed(5)}</span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-muted-foreground">Avg Beta Power</span>
-                    <span className="font-display font-bold">{csvStats.betaAvg}</span>
+                    <span className="font-display font-bold">{csvStats.betaAvg.toFixed(5)}</span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-muted-foreground">Brain State</span>
