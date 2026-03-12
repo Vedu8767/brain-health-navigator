@@ -183,11 +183,11 @@ export default function EEGAnalysis() {
                   </div>
                 ))}
                 <div className="p-3 rounded-lg bg-muted text-center">
-                  <p className="text-lg font-display font-bold">{csvStats.alphaMin}–{csvStats.alphaMax}</p>
+                  <p className="text-lg font-display font-bold">{csvStats.alphaMin.toFixed(5)}–{csvStats.alphaMax.toFixed(5)}</p>
                   <p className="text-xs text-muted-foreground">Alpha Range</p>
                 </div>
                 <div className="p-3 rounded-lg bg-muted text-center">
-                  <p className="text-lg font-display font-bold">{csvStats.betaMin}–{csvStats.betaMax}</p>
+                  <p className="text-lg font-display font-bold">{csvStats.betaMin.toFixed(5)}–{csvStats.betaMax.toFixed(5)}</p>
                   <p className="text-xs text-muted-foreground">Beta Range</p>
                 </div>
               </div>
