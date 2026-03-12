@@ -83,12 +83,12 @@ function computeStats(data: CSVRow[]): CSVStats {
   return {
     totalSamples: data.length,
     stateCounts,
-    alphaMin: +alphaMin.toFixed(2),
-    alphaMax: +alphaMax.toFixed(2),
-    betaMin: +betaMin.toFixed(2),
-    betaMax: +betaMax.toFixed(2),
-    alphaAvg: +(alphaSum / data.length).toFixed(2),
-    betaAvg: +(betaSum / data.length).toFixed(2),
+    alphaMin: alphaMin,
+    alphaMax: alphaMax,
+    betaMin: betaMin,
+    betaMax: betaMax,
+    alphaAvg: alphaSum / data.length,
+    betaAvg: betaSum / data.length,
     mostCommonState,
     uniqueStates,
     accuracy: +accuracy.toFixed(1),
@@ -183,11 +183,11 @@ export default function EEGAnalysis() {
                   </div>
                 ))}
                 <div className="p-3 rounded-lg bg-muted text-center">
-                  <p className="text-lg font-display font-bold">{csvStats.alphaMin}–{csvStats.alphaMax}</p>
+                  <p className="text-lg font-display font-bold">{csvStats.alphaMin.toFixed(5)}–{csvStats.alphaMax.toFixed(5)}</p>
                   <p className="text-xs text-muted-foreground">Alpha Range</p>
                 </div>
                 <div className="p-3 rounded-lg bg-muted text-center">
-                  <p className="text-lg font-display font-bold">{csvStats.betaMin}–{csvStats.betaMax}</p>
+                  <p className="text-lg font-display font-bold">{csvStats.betaMin.toFixed(5)}–{csvStats.betaMax.toFixed(5)}</p>
                   <p className="text-xs text-muted-foreground">Beta Range</p>
                 </div>
               </div>
@@ -301,11 +301,11 @@ export default function EEGAnalysis() {
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-muted-foreground">Avg Alpha Power</span>
-                    <span className="font-display font-bold">{csvStats.alphaAvg}</span>
+                    <span className="font-display font-bold">{csvStats.alphaAvg.toFixed(5)}</span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-muted-foreground">Avg Beta Power</span>
-                    <span className="font-display font-bold">{csvStats.betaAvg}</span>
+                    <span className="font-display font-bold">{csvStats.betaAvg.toFixed(5)}</span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-muted-foreground">Brain State</span>
