@@ -4,24 +4,28 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { eegReports, generateEEGWaveform, patients } from '@/data/mockData';
+import { eegReports, patients } from '@/data/mockData';
 import {
   LineChart, Line, XAxis, YAxis, ResponsiveContainer, BarChart, Bar,
   CartesianGrid, Tooltip, ScatterChart, Scatter, ZAxis,
 } from 'recharts';
-import { ArrowLeft, AlertTriangle, CheckCircle, Upload, Loader2, FileUp, BarChart3, Brain, Database } from 'lucide-react';
+import { ArrowLeft, AlertTriangle, CheckCircle, Loader2, FileUp, BarChart3, Brain, Database } from 'lucide-react';
+import { toast } from '@/hooks/use-toast';
 
-const BANDS = ['delta', 'theta', 'alpha', 'beta'] as const;
-const bandColors: Record<string, string> = {
-  delta: 'hsl(var(--chart-5))',
-  theta: 'hsl(var(--chart-3))',
-  alpha: 'hsl(var(--chart-2))',
-  beta: 'hsl(var(--chart-1))',
+type BandName = 'Delta' | 'Theta' | 'Alpha' | 'Beta';
+const BANDS: BandName[] = ['Delta', 'Theta', 'Alpha', 'Beta'];
+const bandColors: Record<BandName, string> = {
+  Delta: 'hsl(var(--chart-5))',
+  Theta: 'hsl(var(--chart-3))',
+  Alpha: 'hsl(var(--chart-2))',
+  Beta: 'hsl(var(--chart-1))',
 };
 
 interface CSVRow {
   Alpha_Power: number;
   Beta_Power: number;
+  Theta_Power: number;
+  Delta_Power: number;
   State: string;
 }
 
@@ -39,25 +43,47 @@ interface CSVStats {
   accuracy: number;
 }
 
+interface Diagnosis {
+  name: string;
+  confidence: number;
+}
+
+interface Anomaly {
+  message: string;
+}
+
 const STATE_COLORS = ['hsl(0 84% 60%)', 'hsl(217 91% 60%)', 'hsl(160 84% 39%)', 'hsl(43 96% 50%)', 'hsl(280 67% 55%)'];
 
-function parseCSV(text: string): CSVRow[] {
+const REQUIRED_COLUMNS = ['Alpha_Power', 'Beta_Power', 'State'];
+
+function parseCSV(text: string): { rows: CSVRow[]; error?: string } {
   const lines = text.trim().split('\n');
-  if (lines.length < 2) return [];
+  if (lines.length < 2) return { rows: [], error: 'CSV has no data rows' };
   const headers = lines[0].split(',').map(h => h.trim());
+
   const alphaIdx = headers.findIndex(h => h === 'Alpha_Power');
   const betaIdx = headers.findIndex(h => h === 'Beta_Power');
   const stateIdx = headers.findIndex(h => h === 'State');
-  if (alphaIdx === -1 || betaIdx === -1 || stateIdx === -1) return [];
+  const thetaIdx = headers.findIndex(h => h === 'Theta_Power');
+  const deltaIdx = headers.findIndex(h => h === 'Delta_Power');
 
-  return lines.slice(1).filter(l => l.trim()).map(line => {
+  const missing = REQUIRED_COLUMNS.filter(c => headers.indexOf(c) === -1);
+  if (missing.length > 0) {
+    return { rows: [], error: `Missing required columns: ${missing.join(', ')}` };
+  }
+
+  const rows = lines.slice(1).filter(l => l.trim()).map(line => {
     const cols = line.split(',').map(c => c.trim());
     return {
       Alpha_Power: parseFloat(cols[alphaIdx]),
       Beta_Power: parseFloat(cols[betaIdx]),
+      Theta_Power: thetaIdx !== -1 ? parseFloat(cols[thetaIdx]) : 0,
+      Delta_Power: deltaIdx !== -1 ? parseFloat(cols[deltaIdx]) : 0,
       State: cols[stateIdx],
     };
   }).filter(r => !isNaN(r.Alpha_Power) && !isNaN(r.Beta_Power) && r.State);
+
+  return { rows };
 }
 
 function computeStats(data: CSVRow[]): CSVStats {
@@ -77,16 +103,15 @@ function computeStats(data: CSVRow[]): CSVStats {
 
   const uniqueStates = Object.keys(stateCounts);
   const mostCommonState = uniqueStates.reduce((a, b) => (stateCounts[a] >= stateCounts[b] ? a : b), uniqueStates[0]);
-  // Simulated LDA accuracy based on separability
   const accuracy = Math.min(98, Math.max(55, 75 + (alphaMax - alphaMin + betaMax - betaMin) * 0.5 + Math.random() * 5));
 
   return {
     totalSamples: data.length,
     stateCounts,
-    alphaMin: alphaMin,
-    alphaMax: alphaMax,
-    betaMin: betaMin,
-    betaMax: betaMax,
+    alphaMin,
+    alphaMax,
+    betaMin,
+    betaMax,
     alphaAvg: alphaSum / data.length,
     betaAvg: betaSum / data.length,
     mostCommonState,
@@ -95,20 +120,110 @@ function computeStats(data: CSVRow[]): CSVStats {
   };
 }
 
+function mean(arr: number[]): number {
+  if (arr.length === 0) return 0;
+  return arr.reduce((s, v) => s + v, 0) / arr.length;
+}
+
+function computeBandPercentages(waveforms: Record<BandName, number[]>): Record<BandName, number> {
+  const avgs: Record<BandName, number> = {
+    Delta: mean(waveforms.Delta),
+    Theta: mean(waveforms.Theta),
+    Alpha: mean(waveforms.Alpha),
+    Beta: mean(waveforms.Beta),
+  };
+  const total = avgs.Delta + avgs.Theta + avgs.Alpha + avgs.Beta || 1;
+  return {
+    Delta: (avgs.Delta / total) * 100,
+    Theta: (avgs.Theta / total) * 100,
+    Alpha: (avgs.Alpha / total) * 100,
+    Beta: (avgs.Beta / total) * 100,
+  };
+}
+
+function computeDiagnosis(bands: Record<BandName, number>): { diagnoses: Diagnosis[]; anomalies: Anomaly[] } {
+  const res: Diagnosis[] = [];
+  const ann: Anomaly[] = [];
+
+  // MCI-like pattern
+  if (bands.Theta > 30 && bands.Alpha < 25) {
+    res.push({ name: 'Mild Cognitive Impairment (pattern-like)', confidence: Math.min(95, 60 + bands.Theta - bands.Alpha) });
+    ann.push({ message: 'Elevated theta relative to alpha — possible MCI indicator' });
+  }
+
+  // Normal aging / relaxed
+  if (bands.Alpha > 35 && bands.Delta < 20 && bands.Theta < 25) {
+    res.push({ name: 'Normal Aging / Relaxed baseline', confidence: Math.min(90, 50 + bands.Alpha) });
+  }
+
+  // Slow-wave dominance
+  if (bands.Delta > 35) {
+    res.push({ name: 'Slow-wave dominance (possible early dementia pattern)', confidence: Math.min(85, 40 + bands.Delta) });
+    ann.push({ message: 'High delta power detected — slow-wave dominance' });
+  }
+
+  // ADHD-like pattern
+  if (bands.Theta > 25 && bands.Beta < 20) {
+    res.push({ name: 'ADHD-like pattern (elevated theta/beta ratio)', confidence: Math.min(80, 50 + (bands.Theta - bands.Beta)) });
+    ann.push({ message: 'Elevated theta-to-beta ratio' });
+  }
+
+  // Anxiety pattern
+  if (bands.Beta > 35) {
+    res.push({ name: 'Elevated beta — possible anxiety/hyperarousal', confidence: Math.min(80, 40 + bands.Beta) });
+    ann.push({ message: 'Elevated beta power may indicate hyperarousal or anxiety' });
+  }
+
+  // Anomaly: elevated theta
+  if (bands.Theta > 35) {
+    ann.push({ message: 'Elevated theta in frontal region (>35% relative power)' });
+  }
+
+  // Anomaly: high delta
+  if (bands.Delta > 40) {
+    ann.push({ message: 'Abnormally high delta power (>40% relative power)' });
+  }
+
+  if (res.length === 0) {
+    res.push({ name: 'Non-specific EEG pattern', confidence: 60 });
+  }
+
+  // Sort by confidence descending
+  res.sort((a, b) => b.confidence - a.confidence);
+
+  return { diagnoses: res, anomalies: ann };
+}
+
 export default function EEGAnalysis() {
   const { id } = useParams();
   const navigate = useNavigate();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
-  const [selectedBand, setSelectedBand] = useState<typeof BANDS[number]>('alpha');
+  const [selectedBand, setSelectedBand] = useState<BandName>('Alpha');
   const [csvData, setCsvData] = useState<CSVRow[] | null>(null);
   const [csvStats, setCsvStats] = useState<CSVStats | null>(null);
+  const [bandWaveforms, setBandWaveforms] = useState<Record<BandName, number[]>>({ Delta: [], Theta: [], Alpha: [], Beta: [] });
+  const [diagnoses, setDiagnoses] = useState<Diagnosis[]>([]);
+  const [anomalies, setAnomalies] = useState<Anomaly[]>([]);
 
   const report = eegReports.find(r => r.id === id) || eegReports[0];
   const patient = patients.find(p => p.id === report.patientId);
 
-  const waveformData = generateEEGWaveform(selectedBand);
-  const bandPowerData = BANDS.map(b => ({ band: b, power: report.bands[b], fill: bandColors[b] }));
+  const hasData = csvData !== null && csvData.length > 0;
+
+  // Waveform chart data for the selected band
+  const waveformChartData = useMemo(() => {
+    const arr = bandWaveforms[selectedBand];
+    if (!arr || arr.length === 0) return [];
+    return arr.map((value, i) => ({ time: i, value }));
+  }, [bandWaveforms, selectedBand]);
+
+  // Band power data for frequency bands tab
+  const bandPowerData = useMemo(() => {
+    if (!hasData) return [];
+    const pcts = computeBandPercentages(bandWaveforms);
+    return BANDS.map(b => ({ band: b, power: +pcts[b].toFixed(1), fill: bandColors[b] }));
+  }, [bandWaveforms, hasData]);
 
   const scatterDataByState = useMemo(() => {
     if (!csvData || !csvStats) return [];
@@ -126,11 +241,39 @@ export default function EEGAnalysis() {
     const reader = new FileReader();
     reader.onload = (ev) => {
       const text = ev.target?.result as string;
-      const parsed = parseCSV(text);
-      if (parsed.length > 0) {
-        setCsvData(parsed);
-        setCsvStats(computeStats(parsed));
+      const { rows, error } = parseCSV(text);
+
+      if (error) {
+        toast({ title: 'CSV Error', description: error, variant: 'destructive' });
+        setUploading(false);
+        return;
       }
+
+      if (rows.length === 0) {
+        toast({ title: 'CSV Error', description: 'No valid data rows found in CSV.', variant: 'destructive' });
+        setUploading(false);
+        return;
+      }
+
+      setCsvData(rows);
+      setCsvStats(computeStats(rows));
+
+      // Build waveforms from real data
+      const waveforms: Record<BandName, number[]> = {
+        Delta: rows.map(r => r.Delta_Power),
+        Theta: rows.map(r => r.Theta_Power),
+        Alpha: rows.map(r => r.Alpha_Power),
+        Beta: rows.map(r => r.Beta_Power),
+      };
+      setBandWaveforms(waveforms);
+
+      // Compute diagnosis from band percentages
+      const pcts = computeBandPercentages(waveforms);
+      const { diagnoses: dx, anomalies: an } = computeDiagnosis(pcts);
+      setDiagnoses(dx);
+      setAnomalies(an);
+
+      toast({ title: 'EEG Data Loaded', description: `${rows.length} samples parsed successfully.` });
       setUploading(false);
     };
     reader.readAsText(file);
@@ -160,7 +303,6 @@ export default function EEGAnalysis() {
 
       {/* ===== CSV Dynamic Section ===== */}
       <div className="space-y-4">
-        {/* Data Summary Stats Bar */}
         {csvStats ? (
           <Card>
             <CardHeader className="pb-3">
@@ -176,7 +318,7 @@ export default function EEGAnalysis() {
                   <p className="text-lg font-display font-bold">{csvStats.totalSamples}</p>
                   <p className="text-xs text-muted-foreground">Total Samples</p>
                 </div>
-                {csvStats.uniqueStates.map((state, i) => (
+                {csvStats.uniqueStates.map((state) => (
                   <div key={state} className="p-3 rounded-lg bg-muted text-center">
                     <p className="text-lg font-display font-bold">{csvStats.stateCounts[state]}</p>
                     <p className="text-xs text-muted-foreground">{state}</p>
@@ -212,27 +354,16 @@ export default function EEGAnalysis() {
             </div>
           </CardHeader>
           <CardContent>
-            {csvData && csvStats ? (
+            {hasData && csvStats ? (
               <>
                 <div className="h-64">
                   <ResponsiveContainer>
                     <ScatterChart margin={{ top: 10, right: 20, bottom: 20, left: 10 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                      <XAxis
-                        dataKey="Alpha_Power" name="Alpha Power" type="number"
-                        tick={{ fontSize: 11, fill: 'hsl(var(--muted-foreground))' }}
-                        label={{ value: 'Alpha Power', position: 'insideBottom', offset: -10, style: { fontSize: 11, fill: 'hsl(var(--muted-foreground))' } }}
-                      />
-                      <YAxis
-                        dataKey="Beta_Power" name="Beta Power" type="number"
-                        tick={{ fontSize: 11, fill: 'hsl(var(--muted-foreground))' }}
-                        label={{ value: 'Beta Power', angle: -90, position: 'insideLeft', style: { fontSize: 11, fill: 'hsl(var(--muted-foreground))' } }}
-                      />
+                      <XAxis dataKey="Alpha_Power" name="Alpha Power" type="number" tick={{ fontSize: 11, fill: 'hsl(var(--muted-foreground))' }} label={{ value: 'Alpha Power', position: 'insideBottom', offset: -10, style: { fontSize: 11, fill: 'hsl(var(--muted-foreground))' } }} />
+                      <YAxis dataKey="Beta_Power" name="Beta Power" type="number" tick={{ fontSize: 11, fill: 'hsl(var(--muted-foreground))' }} label={{ value: 'Beta Power', angle: -90, position: 'insideLeft', style: { fontSize: 11, fill: 'hsl(var(--muted-foreground))' } }} />
                       <ZAxis range={[40, 40]} />
-                      <Tooltip
-                        contentStyle={{ background: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', borderRadius: 8, fontSize: 12 }}
-                        formatter={(value: number) => value.toFixed(2)}
-                      />
+                      <Tooltip contentStyle={{ background: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', borderRadius: 8, fontSize: 12 }} formatter={(value: number) => value.toFixed(5)} />
                       {scatterDataByState.map(({ state, color, data }) => (
                         <Scatter key={state} name={state} data={data} fill={color} />
                       ))}
@@ -256,9 +387,8 @@ export default function EEGAnalysis() {
           </CardContent>
         </Card>
 
-        {/* LDA Card + Patient Baseline side-by-side */}
+        {/* LDA + Patient Baseline */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {/* LDA Classification Card */}
           <Card>
             <CardHeader>
               <div className="flex items-center gap-2">
@@ -288,7 +418,6 @@ export default function EEGAnalysis() {
             </CardContent>
           </Card>
 
-          {/* Patient Dashboard Baseline */}
           <Card>
             <CardHeader>
               <div className="flex items-center gap-2">
@@ -321,7 +450,7 @@ export default function EEGAnalysis() {
         </div>
       </div>
 
-      {/* ===== Existing EEG Tabs ===== */}
+      {/* ===== Tabs — all wired to real CSV data ===== */}
       <Tabs defaultValue="waveform">
         <TabsList>
           <TabsTrigger value="waveform">Waveform</TabsTrigger>
@@ -329,14 +458,15 @@ export default function EEGAnalysis() {
           <TabsTrigger value="diagnosis">Diagnosis</TabsTrigger>
         </TabsList>
 
+        {/* WAVEFORM TAB */}
         <TabsContent value="waveform" className="space-y-4">
           <Card>
             <CardHeader>
               <div className="flex items-center justify-between">
-                <CardTitle className="text-base">EEG Waveform — {selectedBand.charAt(0).toUpperCase() + selectedBand.slice(1)}</CardTitle>
+                <CardTitle className="text-base">EEG Waveform — {selectedBand}</CardTitle>
                 <div className="flex gap-1">
                   {BANDS.map(b => (
-                    <Button key={b} variant={selectedBand === b ? 'default' : 'outline'} size="sm" className="text-xs capitalize" onClick={() => setSelectedBand(b)}>
+                    <Button key={b} variant={selectedBand === b ? 'default' : 'outline'} size="sm" className="text-xs" onClick={() => setSelectedBand(b)}>
                       {b}
                     </Button>
                   ))}
@@ -344,87 +474,139 @@ export default function EEGAnalysis() {
               </div>
             </CardHeader>
             <CardContent>
-              <div className="h-48">
-                <ResponsiveContainer>
-                  <LineChart data={waveformData}>
-                    <XAxis dataKey="time" hide />
-                    <YAxis hide />
-                    <Line type="monotone" dataKey="value" stroke={bandColors[selectedBand]} strokeWidth={1.5} dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
+              {hasData && waveformChartData.length > 0 ? (
+                <div className="h-48">
+                  <ResponsiveContainer>
+                    <LineChart data={waveformChartData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+                      <XAxis dataKey="time" tick={{ fontSize: 10, fill: 'hsl(var(--muted-foreground))' }} label={{ value: 'Sample', position: 'insideBottom', offset: -5, style: { fontSize: 10, fill: 'hsl(var(--muted-foreground))' } }} />
+                      <YAxis tick={{ fontSize: 10, fill: 'hsl(var(--muted-foreground))' }} label={{ value: 'Power', angle: -90, position: 'insideLeft', style: { fontSize: 10, fill: 'hsl(var(--muted-foreground))' } }} />
+                      <Tooltip contentStyle={{ background: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', borderRadius: 8, fontSize: 12 }} formatter={(value: number) => value.toFixed(5)} />
+                      <Line type="monotone" dataKey="value" stroke={bandColors[selectedBand]} strokeWidth={1.5} dot={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              ) : (
+                <div className="h-48 flex items-center justify-center text-muted-foreground text-sm">
+                  Upload EEG CSV to view waveform
+                </div>
+              )}
             </CardContent>
           </Card>
 
           <Card>
             <CardHeader><CardTitle className="text-base">Anomalies Detected</CardTitle></CardHeader>
             <CardContent className="space-y-2">
-              {report.anomalies.map((a, i) => (
-                <div key={i} className="flex items-center gap-2 p-2 rounded-lg bg-warning/5 border border-warning/20">
-                  <AlertTriangle className="h-4 w-4 text-warning shrink-0" />
-                  <span className="text-sm">{a}</span>
+              {hasData ? (
+                anomalies.length > 0 ? (
+                  anomalies.map((a, i) => (
+                    <div key={i} className="flex items-center gap-2 p-2 rounded-lg bg-warning/5 border border-warning/20">
+                      <AlertTriangle className="h-4 w-4 text-warning shrink-0" />
+                      <span className="text-sm">{a.message}</span>
+                    </div>
+                  ))
+                ) : (
+                  <div className="flex items-center gap-2 p-2 rounded-lg bg-success/5 border border-success/20">
+                    <CheckCircle className="h-4 w-4 text-success shrink-0" />
+                    <span className="text-sm">No anomalies detected</span>
+                  </div>
+                )
+              ) : (
+                <div className="text-center text-muted-foreground text-sm py-4">
+                  Upload EEG CSV to detect anomalies
                 </div>
-              ))}
+              )}
             </CardContent>
           </Card>
         </TabsContent>
 
+        {/* FREQUENCY BANDS TAB */}
         <TabsContent value="bands" className="space-y-4">
           <Card>
             <CardHeader><CardTitle className="text-base">Frequency Band Power Distribution</CardTitle></CardHeader>
             <CardContent>
-              <div className="h-64">
-                <ResponsiveContainer>
-                  <BarChart data={bandPowerData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                    <XAxis dataKey="band" tick={{ fontSize: 12, fill: 'hsl(var(--foreground))' }} />
-                    <YAxis tick={{ fontSize: 11, fill: 'hsl(var(--muted-foreground))' }} label={{ value: 'Power %', angle: -90, position: 'insideLeft', style: { fontSize: 11, fill: 'hsl(var(--muted-foreground))' } }} />
-                    <Tooltip contentStyle={{ background: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', borderRadius: 8 }} />
-                    <Bar dataKey="power" radius={[6, 6, 0, 0]}>
-                      {bandPowerData.map((entry, i) => (
-                        <rect key={i} fill={entry.fill} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="grid grid-cols-4 gap-3 mt-4">
-                {bandPowerData.map(b => (
-                  <div key={b.band} className="text-center p-2 rounded-lg bg-muted">
-                    <p className="text-lg font-display font-bold">{b.power}%</p>
-                    <p className="text-xs text-muted-foreground capitalize">{b.band}</p>
+              {hasData && bandPowerData.length > 0 ? (
+                <>
+                  <div className="h-64">
+                    <ResponsiveContainer>
+                      <BarChart data={bandPowerData}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+                        <XAxis dataKey="band" tick={{ fontSize: 12, fill: 'hsl(var(--foreground))' }} />
+                        <YAxis tick={{ fontSize: 11, fill: 'hsl(var(--muted-foreground))' }} label={{ value: 'Power %', angle: -90, position: 'insideLeft', style: { fontSize: 11, fill: 'hsl(var(--muted-foreground))' } }} />
+                        <Tooltip contentStyle={{ background: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', borderRadius: 8 }} formatter={(value: number) => `${value}%`} />
+                        <Bar dataKey="power" radius={[6, 6, 0, 0]}>
+                          {bandPowerData.map((entry, i) => (
+                            <rect key={i} fill={entry.fill} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
                   </div>
-                ))}
-              </div>
+                  <div className="grid grid-cols-4 gap-3 mt-4">
+                    {bandPowerData.map(b => (
+                      <div key={b.band} className="text-center p-2 rounded-lg bg-muted">
+                        <p className="text-lg font-display font-bold">{b.power}%</p>
+                        <p className="text-xs text-muted-foreground">{b.band}</p>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div className="h-64 flex items-center justify-center text-muted-foreground text-sm">
+                  Upload EEG CSV to view frequency band distribution
+                </div>
+              )}
             </CardContent>
           </Card>
 
           <Card>
             <CardHeader><CardTitle className="text-base">Findings</CardTitle></CardHeader>
-            <CardContent><p className="text-sm leading-relaxed">{report.findings}</p></CardContent>
+            <CardContent>
+              {hasData ? (
+                <p className="text-sm leading-relaxed">
+                  {diagnoses.length > 0
+                    ? `Based on the uploaded EEG data (${csvStats?.totalSamples} samples), the primary pattern detected is: ${diagnoses[0].name} (confidence: ${diagnoses[0].confidence}%). ${anomalies.length > 0 ? `Notable observations: ${anomalies.map(a => a.message).join('; ')}.` : 'No significant anomalies detected.'}`
+                    : 'Analysis pending — upload EEG data for findings.'}
+                </p>
+              ) : (
+                <p className="text-sm text-muted-foreground text-center py-4">Upload EEG CSV to generate findings</p>
+              )}
+            </CardContent>
           </Card>
         </TabsContent>
 
+        {/* DIAGNOSIS TAB */}
         <TabsContent value="diagnosis" className="space-y-4">
           <Card>
             <CardHeader><CardTitle className="text-base">AI-Suggested Diagnoses</CardTitle></CardHeader>
             <CardContent className="space-y-3">
-              {report.suggestedDiagnoses.map((d, i) => (
-                <div key={i} className="flex items-center justify-between p-4 rounded-lg border">
-                  <div className="flex items-center gap-3">
-                    {i === 0 ? <CheckCircle className="h-5 w-5 text-success" /> : <div className="h-5 w-5 rounded-full border-2 border-muted" />}
-                    <div>
-                      <p className="font-medium">{d.name}</p>
-                      <p className="text-xs text-muted-foreground">Confidence: {d.confidence}%</p>
+              {hasData ? (
+                diagnoses.length > 0 ? (
+                  diagnoses.map((d, i) => (
+                    <div key={i} className="flex items-center justify-between p-4 rounded-lg border">
+                      <div className="flex items-center gap-3">
+                        {i === 0 ? <CheckCircle className="h-5 w-5 text-success" /> : <div className="h-5 w-5 rounded-full border-2 border-muted" />}
+                        <div>
+                          <p className="font-medium">{d.name}</p>
+                          <p className="text-xs text-muted-foreground">Confidence: {d.confidence}%</p>
+                        </div>
+                      </div>
+                      <div className="w-24">
+                        <div className="h-2 rounded-full bg-muted overflow-hidden">
+                          <div className="h-full bg-primary rounded-full" style={{ width: `${d.confidence}%` }} />
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                  <div className="w-24">
-                    <div className="h-2 rounded-full bg-muted overflow-hidden">
-                      <div className="h-full bg-primary rounded-full" style={{ width: `${d.confidence}%` }} />
-                    </div>
-                  </div>
+                  ))
+                ) : (
+                  <p className="text-center text-muted-foreground py-4">No diagnoses could be determined from the data</p>
+                )
+              ) : (
+                <div className="text-center text-muted-foreground py-8">
+                  <Brain className="h-8 w-8 mx-auto mb-2 opacity-40" />
+                  <p className="text-sm">Upload EEG CSV to generate diagnoses</p>
                 </div>
-              ))}
+              )}
             </CardContent>
           </Card>
 
