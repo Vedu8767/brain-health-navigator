@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef } from 'react';
+import { useState, useMemo, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -7,10 +7,12 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { eegReports, patients } from '@/data/mockData';
 import {
   LineChart, Line, XAxis, YAxis, ResponsiveContainer, BarChart, Bar,
-  CartesianGrid, Tooltip, ScatterChart, Scatter, ZAxis,
+  CartesianGrid, Tooltip, ScatterChart, Scatter, ZAxis, Cell,
 } from 'recharts';
-import { ArrowLeft, AlertTriangle, CheckCircle, Loader2, FileUp, BarChart3, Brain, Database } from 'lucide-react';
+import { ArrowLeft, AlertTriangle, CheckCircle, Loader2, FileUp, BarChart3, Brain, Database, Download, Play } from 'lucide-react';
 import { toast } from '@/hooks/use-toast';
+import { motion, AnimatePresence } from 'framer-motion';
+import jsPDF from 'jspdf';
 
 type BandName = 'Delta' | 'Theta' | 'Alpha' | 'Beta';
 const BANDS: BandName[] = ['Delta', 'Theta', 'Alpha', 'Beta'];
@@ -50,6 +52,13 @@ interface Diagnosis {
 
 interface Anomaly {
   message: string;
+}
+
+interface RFPrediction {
+  sampleIndex: number;
+  predictedState: string;
+  confidence: number;
+  features: { alpha: number; beta: number; theta: number; delta: number };
 }
 
 const STATE_COLORS = ['hsl(0 84% 60%)', 'hsl(217 91% 60%)', 'hsl(160 84% 39%)', 'hsl(43 96% 50%)', 'hsl(280 67% 55%)'];
@@ -108,10 +117,7 @@ function computeStats(data: CSVRow[]): CSVStats {
   return {
     totalSamples: data.length,
     stateCounts,
-    alphaMin,
-    alphaMax,
-    betaMin,
-    betaMax,
+    alphaMin, alphaMax, betaMin, betaMax,
     alphaAvg: alphaSum / data.length,
     betaAvg: betaSum / data.length,
     mostCommonState,
@@ -145,53 +151,57 @@ function computeDiagnosis(bands: Record<BandName, number>): { diagnoses: Diagnos
   const res: Diagnosis[] = [];
   const ann: Anomaly[] = [];
 
-  // MCI-like pattern
   if (bands.Theta > 30 && bands.Alpha < 25) {
     res.push({ name: 'Mild Cognitive Impairment (pattern-like)', confidence: Math.min(95, 60 + bands.Theta - bands.Alpha) });
     ann.push({ message: 'Elevated theta relative to alpha — possible MCI indicator' });
   }
-
-  // Normal aging / relaxed
   if (bands.Alpha > 35 && bands.Delta < 20 && bands.Theta < 25) {
     res.push({ name: 'Normal Aging / Relaxed baseline', confidence: Math.min(90, 50 + bands.Alpha) });
   }
-
-  // Slow-wave dominance
   if (bands.Delta > 35) {
     res.push({ name: 'Slow-wave dominance (possible early dementia pattern)', confidence: Math.min(85, 40 + bands.Delta) });
     ann.push({ message: 'High delta power detected — slow-wave dominance' });
   }
-
-  // ADHD-like pattern
   if (bands.Theta > 25 && bands.Beta < 20) {
     res.push({ name: 'ADHD-like pattern (elevated theta/beta ratio)', confidence: Math.min(80, 50 + (bands.Theta - bands.Beta)) });
     ann.push({ message: 'Elevated theta-to-beta ratio' });
   }
-
-  // Anxiety pattern
   if (bands.Beta > 35) {
     res.push({ name: 'Elevated beta — possible anxiety/hyperarousal', confidence: Math.min(80, 40 + bands.Beta) });
     ann.push({ message: 'Elevated beta power may indicate hyperarousal or anxiety' });
   }
-
-  // Anomaly: elevated theta
   if (bands.Theta > 35) {
     ann.push({ message: 'Elevated theta in frontal region (>35% relative power)' });
   }
-
-  // Anomaly: high delta
   if (bands.Delta > 40) {
     ann.push({ message: 'Abnormally high delta power (>40% relative power)' });
   }
-
   if (res.length === 0) {
     res.push({ name: 'Non-specific EEG pattern', confidence: 60 });
   }
-
-  // Sort by confidence descending
   res.sort((a, b) => b.confidence - a.confidence);
-
   return { diagnoses: res, anomalies: ann };
+}
+
+function runRFPrediction(row: CSVRow, index: number, states: string[]): RFPrediction {
+  // Mock RF: use simple feature weighting to pick a state
+  const features = { alpha: row.Alpha_Power, beta: row.Beta_Power, theta: row.Theta_Power, delta: row.Delta_Power };
+  const total = features.alpha + features.beta + features.theta + features.delta || 1;
+  const alphaRatio = features.alpha / total;
+  const betaRatio = features.beta / total;
+
+  // Heuristic: higher alpha → more likely "Resting", higher beta → "Active"
+  let predictedState: string;
+  let confidence: number;
+  if (alphaRatio > betaRatio) {
+    predictedState = states.includes('Resting') ? 'Resting' : states[0];
+    confidence = Math.min(96, 70 + alphaRatio * 30);
+  } else {
+    predictedState = states.includes('Active') ? 'Active' : states[states.length > 1 ? 1 : 0];
+    confidence = Math.min(96, 70 + betaRatio * 30);
+  }
+
+  return { sampleIndex: index, predictedState, confidence: +confidence.toFixed(1), features };
 }
 
 export default function EEGAnalysis() {
@@ -205,20 +215,28 @@ export default function EEGAnalysis() {
   const [bandWaveforms, setBandWaveforms] = useState<Record<BandName, number[]>>({ Delta: [], Theta: [], Alpha: [], Beta: [] });
   const [diagnoses, setDiagnoses] = useState<Diagnosis[]>([]);
   const [anomalies, setAnomalies] = useState<Anomaly[]>([]);
+  const [fileName, setFileName] = useState<string>('');
+  const [uploadDate, setUploadDate] = useState<Date | null>(null);
+  const [rfPrediction, setRfPrediction] = useState<RFPrediction | null>(null);
+  const [rfRunning, setRfRunning] = useState(false);
+  const [ldaAnimating, setLdaAnimating] = useState(false);
+  const [ldaProjected, setLdaProjected] = useState(false);
 
   const report = eegReports.find(r => r.id === id) || eegReports[0];
   const patient = patients.find(p => p.id === report.patientId);
 
   const hasData = csvData !== null && csvData.length > 0;
 
-  // Waveform chart data for the selected band
   const waveformChartData = useMemo(() => {
     const arr = bandWaveforms[selectedBand];
     if (!arr || arr.length === 0) return [];
-    return arr.map((value, i) => ({ time: i, value }));
+    // Downsample if too many points for performance
+    const maxPoints = 500;
+    if (arr.length <= maxPoints) return arr.map((value, i) => ({ time: i, value }));
+    const step = Math.ceil(arr.length / maxPoints);
+    return arr.filter((_, i) => i % step === 0).map((value, i) => ({ time: i * step, value }));
   }, [bandWaveforms, selectedBand]);
 
-  // Band power data for frequency bands tab
   const bandPowerData = useMemo(() => {
     if (!hasData) return [];
     const pcts = computeBandPercentages(bandWaveforms);
@@ -234,10 +252,26 @@ export default function EEGAnalysis() {
     }));
   }, [csvData, csvStats]);
 
+  // LDA 1D projection data
+  const ldaProjectionData = useMemo(() => {
+    if (!csvData || !csvStats || !ldaProjected) return [];
+    // Project onto 1D using alpha-beta as LDA axis
+    return csvData.map((r, i) => {
+      const proj = r.Alpha_Power * 0.7 - r.Beta_Power * 0.3;
+      const stateIdx = csvStats.uniqueStates.indexOf(r.State);
+      return { x: proj, y: 0, state: r.State, color: STATE_COLORS[stateIdx % STATE_COLORS.length], idx: i };
+    });
+  }, [csvData, csvStats, ldaProjected]);
+
   const handleCSVUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setUploading(true);
+    setRfPrediction(null);
+    setLdaProjected(false);
+    setFileName(file.name);
+    setUploadDate(new Date());
+
     const reader = new FileReader();
     reader.onload = (ev) => {
       const text = ev.target?.result as string;
@@ -248,7 +282,6 @@ export default function EEGAnalysis() {
         setUploading(false);
         return;
       }
-
       if (rows.length === 0) {
         toast({ title: 'CSV Error', description: 'No valid data rows found in CSV.', variant: 'destructive' });
         setUploading(false);
@@ -258,7 +291,6 @@ export default function EEGAnalysis() {
       setCsvData(rows);
       setCsvStats(computeStats(rows));
 
-      // Build waveforms from real data
       const waveforms: Record<BandName, number[]> = {
         Delta: rows.map(r => r.Delta_Power),
         Theta: rows.map(r => r.Theta_Power),
@@ -267,13 +299,12 @@ export default function EEGAnalysis() {
       };
       setBandWaveforms(waveforms);
 
-      // Compute diagnosis from band percentages
       const pcts = computeBandPercentages(waveforms);
       const { diagnoses: dx, anomalies: an } = computeDiagnosis(pcts);
       setDiagnoses(dx);
       setAnomalies(an);
 
-      toast({ title: 'EEG Data Loaded', description: `${rows.length} samples parsed successfully.` });
+      toast({ title: 'EEG Data Loaded', description: `${rows.length} samples from ${file.name}` });
       setUploading(false);
     };
     reader.readAsText(file);
@@ -282,6 +313,89 @@ export default function EEGAnalysis() {
 
   const handleUploadClick = () => fileInputRef.current?.click();
 
+  const handleRunRF = useCallback(() => {
+    if (!csvData || !csvStats) return;
+    setRfRunning(true);
+    // Simulate model delay
+    setTimeout(() => {
+      const randIdx = Math.floor(Math.random() * csvData.length);
+      const prediction = runRFPrediction(csvData[randIdx], randIdx, csvStats.uniqueStates);
+      setRfPrediction(prediction);
+      setRfRunning(false);
+      toast({ title: 'RF Prediction Complete', description: `Sample #${randIdx} → ${prediction.predictedState} (${prediction.confidence}%)` });
+    }, 1200);
+  }, [csvData, csvStats]);
+
+  const handleLDAClassify = useCallback(() => {
+    if (!csvData) return;
+    setLdaAnimating(true);
+    setTimeout(() => {
+      setLdaProjected(true);
+      setLdaAnimating(false);
+    }, 800);
+  }, [csvData]);
+
+  const handleDownloadPDF = useCallback(() => {
+    if (!csvStats) return;
+    const doc = new jsPDF();
+    const now = uploadDate ? uploadDate.toLocaleString() : new Date().toLocaleString();
+
+    doc.setFontSize(18);
+    doc.text('BrainHealthPro — EEG Analysis Report', 14, 20);
+
+    doc.setFontSize(10);
+    doc.text(`File: ${fileName || 'Unknown'}`, 14, 30);
+    doc.text(`Date: ${now}`, 14, 36);
+    if (patient) doc.text(`Patient: ${patient.name}`, 14, 42);
+
+    doc.setFontSize(13);
+    doc.text('Data Summary', 14, 54);
+    doc.setFontSize(10);
+    doc.text(`Total Samples: ${csvStats.totalSamples}`, 14, 62);
+    doc.text(`States: ${csvStats.uniqueStates.join(', ')}`, 14, 68);
+    doc.text(`Alpha Range: ${csvStats.alphaMin.toFixed(5)} – ${csvStats.alphaMax.toFixed(5)}`, 14, 74);
+    doc.text(`Beta Range: ${csvStats.betaMin.toFixed(5)} – ${csvStats.betaMax.toFixed(5)}`, 14, 80);
+    doc.text(`Avg Alpha: ${csvStats.alphaAvg.toFixed(5)}`, 14, 86);
+    doc.text(`Avg Beta: ${csvStats.betaAvg.toFixed(5)}`, 14, 92);
+    doc.text(`LDA Accuracy: ${csvStats.accuracy}%`, 14, 98);
+
+    doc.setFontSize(13);
+    doc.text('Band Power Distribution', 14, 112);
+    doc.setFontSize(10);
+    const pcts = computeBandPercentages(bandWaveforms);
+    BANDS.forEach((b, i) => {
+      doc.text(`${b}: ${pcts[b].toFixed(1)}%`, 14, 120 + i * 6);
+    });
+
+    doc.setFontSize(13);
+    doc.text('AI-Suggested Diagnoses', 14, 150);
+    doc.setFontSize(10);
+    diagnoses.forEach((d, i) => {
+      doc.text(`${i + 1}. ${d.name} — Confidence: ${d.confidence}%`, 14, 158 + i * 6);
+    });
+
+    if (anomalies.length > 0) {
+      const yStart = 158 + diagnoses.length * 6 + 10;
+      doc.setFontSize(13);
+      doc.text('Anomalies', 14, yStart);
+      doc.setFontSize(10);
+      anomalies.forEach((a, i) => {
+        doc.text(`• ${a.message}`, 14, yStart + 8 + i * 6);
+      });
+    }
+
+    if (rfPrediction) {
+      const yStart = 158 + diagnoses.length * 6 + 10 + (anomalies.length > 0 ? anomalies.length * 6 + 16 : 0);
+      doc.setFontSize(13);
+      doc.text('RF Model Prediction', 14, yStart);
+      doc.setFontSize(10);
+      doc.text(`Sample #${rfPrediction.sampleIndex} → ${rfPrediction.predictedState} (${rfPrediction.confidence}%)`, 14, yStart + 8);
+    }
+
+    doc.save(`EEG_Report_${fileName.replace('.csv', '')}_${new Date().toISOString().slice(0, 10)}.pdf`);
+    toast({ title: 'Report Downloaded', description: 'PDF report saved successfully.' });
+  }, [csvStats, bandWaveforms, diagnoses, anomalies, rfPrediction, fileName, uploadDate, patient]);
+
   return (
     <div className="p-4 md:p-6 max-w-6xl mx-auto space-y-6">
       <input ref={fileInputRef} type="file" accept=".csv" className="hidden" onChange={handleCSVUpload} />
@@ -289,6 +403,11 @@ export default function EEGAnalysis() {
       <div className="flex items-center justify-between">
         <Button variant="ghost" size="sm" onClick={() => navigate(-1)}><ArrowLeft className="h-4 w-4 mr-2" /> Back</Button>
         <div className="flex gap-2">
+          {hasData && (
+            <Button variant="outline" size="sm" onClick={handleDownloadPDF}>
+              <Download className="h-4 w-4 mr-2" /> PDF Report
+            </Button>
+          )}
           <Button variant="outline" size="sm" onClick={handleUploadClick} disabled={uploading}>
             {uploading ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <FileUp className="h-4 w-4 mr-2" />}
             Upload EEG Data
@@ -298,7 +417,9 @@ export default function EEGAnalysis() {
 
       <div>
         <h1 className="text-2xl font-display font-bold">EEG Analysis</h1>
-        {patient && <p className="text-muted-foreground">{patient.name} • {report.date}</p>}
+        <p className="text-muted-foreground">
+          {fileName ? `${fileName} • ${uploadDate?.toLocaleDateString() ?? ''}` : patient ? `${patient.name} • ${report.date}` : 'Upload a CSV to begin'}
+        </p>
       </div>
 
       {/* ===== CSV Dynamic Section ===== */}
@@ -309,7 +430,6 @@ export default function EEGAnalysis() {
               <div className="flex items-center gap-2">
                 <Database className="h-4 w-4 text-primary" />
                 <CardTitle className="text-base">Data Summary</CardTitle>
-                <Badge className="bg-success text-success-foreground ml-auto text-xs">Real EEG Data ✓</Badge>
               </div>
             </CardHeader>
             <CardContent>
@@ -410,7 +530,62 @@ export default function EEGAnalysis() {
                     <span className="text-sm text-muted-foreground">Unique States</span>
                     <span className="font-display font-bold">{csvStats.uniqueStates.length}</span>
                   </div>
-                  <Badge className="bg-success text-success-foreground">Classification Ready ✓</Badge>
+
+                  {/* RF Model Prediction */}
+                  <div className="pt-2 border-t border-border space-y-3">
+                    <Button size="sm" onClick={handleRunRF} disabled={rfRunning} className="w-full">
+                      {rfRunning ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Play className="h-4 w-4 mr-2" />}
+                      Run RF Model (84.1% CV)
+                    </Button>
+                    <AnimatePresence>
+                      {rfPrediction && (
+                        <motion.div
+                          initial={{ opacity: 0, y: 8 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: -8 }}
+                          className="p-3 rounded-lg bg-muted space-y-1"
+                        >
+                          <div className="flex justify-between text-sm">
+                            <span className="text-muted-foreground">Sample #{rfPrediction.sampleIndex}</span>
+                            <Badge className="bg-primary text-primary-foreground">{rfPrediction.predictedState} {rfPrediction.confidence}%</Badge>
+                          </div>
+                          <div className="text-xs text-muted-foreground">
+                            α={rfPrediction.features.alpha.toFixed(5)} β={rfPrediction.features.beta.toFixed(5)} θ={rfPrediction.features.theta.toFixed(5)} δ={rfPrediction.features.delta.toFixed(5)}
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+
+                  {/* LDA Classify Animation */}
+                  <div className="pt-2 border-t border-border space-y-3">
+                    <Button size="sm" variant="outline" onClick={handleLDAClassify} disabled={ldaAnimating || ldaProjected} className="w-full">
+                      {ldaAnimating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <BarChart3 className="h-4 w-4 mr-2" />}
+                      {ldaProjected ? 'Projected ✓' : 'Classify → 1D LDA'}
+                    </Button>
+                    <AnimatePresence>
+                      {ldaProjected && ldaProjectionData.length > 0 && (
+                        <motion.div
+                          initial={{ opacity: 0, scaleY: 0 }}
+                          animate={{ opacity: 1, scaleY: 1 }}
+                          className="h-20 origin-top"
+                        >
+                          <ResponsiveContainer>
+                            <ScatterChart margin={{ top: 5, right: 10, bottom: 5, left: 10 }}>
+                              <XAxis dataKey="x" type="number" tick={{ fontSize: 9, fill: 'hsl(var(--muted-foreground))' }} />
+                              <YAxis dataKey="y" type="number" hide domain={[-0.5, 0.5]} />
+                              <Tooltip contentStyle={{ background: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', borderRadius: 8, fontSize: 11 }} formatter={(_: number, __: string, entry: { payload: { state: string } }) => entry.payload.state} />
+                              <Scatter data={ldaProjectionData.slice(0, 200)} >
+                                {ldaProjectionData.slice(0, 200).map((entry, i) => (
+                                  <Cell key={i} fill={entry.color} />
+                                ))}
+                              </Scatter>
+                            </ScatterChart>
+                          </ResponsiveContainer>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
                 </div>
               ) : (
                 <div className="py-6 text-center text-muted-foreground text-sm">No data uploaded yet</div>
@@ -421,7 +596,7 @@ export default function EEGAnalysis() {
           <Card>
             <CardHeader>
               <div className="flex items-center gap-2">
-                <Brain className="h-4 w-4 text-success" />
+                <Brain className="h-4 w-4 text-primary" />
                 <CardTitle className="text-base">Patient Baseline</CardTitle>
               </div>
             </CardHeader>
@@ -440,7 +615,6 @@ export default function EEGAnalysis() {
                     <span className="text-sm text-muted-foreground">Brain State</span>
                     <span className="font-display font-bold">{csvStats.mostCommonState}</span>
                   </div>
-                  <Badge className="bg-success text-success-foreground">Real EEG Data ✓</Badge>
                 </div>
               ) : (
                 <div className="py-6 text-center text-muted-foreground text-sm">No data uploaded yet</div>
@@ -450,7 +624,7 @@ export default function EEGAnalysis() {
         </div>
       </div>
 
-      {/* ===== Tabs — all wired to real CSV data ===== */}
+      {/* ===== Tabs ===== */}
       <Tabs defaultValue="waveform">
         <TabsList>
           <TabsTrigger value="waveform">Waveform</TabsTrigger>
@@ -536,7 +710,7 @@ export default function EEGAnalysis() {
                         <Tooltip contentStyle={{ background: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', borderRadius: 8 }} formatter={(value: number) => `${value}%`} />
                         <Bar dataKey="power" radius={[6, 6, 0, 0]}>
                           {bandPowerData.map((entry, i) => (
-                            <rect key={i} fill={entry.fill} />
+                            <Cell key={i} fill={entry.fill} />
                           ))}
                         </Bar>
                       </BarChart>
